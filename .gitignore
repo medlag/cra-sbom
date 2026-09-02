@@ -1,0 +1,4 @@
+artifacts/
+cra-out/
+__pycache__/
+*.pyc
