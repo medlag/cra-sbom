@@ -91,9 +91,11 @@ An advisory is not automatically a CRA report. The September 2026 obligation tri
 
 ## In CI
 
-`.github/workflows/sbom.yml` generates the SBOM on every release and uploads it as a
-build artifact, so the inventory always matches the binary you shipped. That pairing is
-the part auditors care about.
+Copy [`examples/sbom.yml`](examples/sbom.yml) into your own `.github/workflows/`. It
+generates the SBOM on every release and attaches it to the release, so the inventory
+always matches the binary you shipped — the pairing auditors care about.
+
+Requires Python 3.10 or newer. No packages.
 
 ## Scope, honestly
 
