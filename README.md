@@ -33,14 +33,27 @@ answer in the next ten minutes without adding a global tool, a CI package, or a 
 - **Test dependencies are separated.** xUnit does not ship to your customers, so it
   is scoped `optional` in the SBOM and excluded from the CRA counts.
 - **It reports, not just lists.** The version conflicts are the finding.
+- **Provenance is version-correct.** A parent is recorded against the version actually
+  resolved in that target — not against every version of that package in the solution.
+
+## Tests
+
+```bash
+python -m unittest -v
+```
+
+18 tests, standard library only, no pytest. They cover the things that are easy to get
+wrong: version-correct provenance, transitively-pinned packages not counting as direct,
+project references not appearing as parent packages, and test projects staying out of
+the shipped set.
 
 ## What the report tells you
 
 Run against a real 136-project .NET 9 modular monolith:
 
 ```
-| Components in shipped product | 436   |
-| Declared directly in a csproj | 135   |
+| Components in shipped product | 438   |
+| Declared directly in a csproj | 137   |
 | Pulled in transitively        | 301   |
 | Amplification                 | 3.2x  |
 

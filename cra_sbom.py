@@ -1,11 +1,9 @@
-"""
-CRA readiness for a .NET solution, with no tooling to install.
+"""CRA readiness and CycloneDX SBOM for a .NET solution.
 
-Reads every obj/project.assets.json NuGet already produced during restore and emits:
-  1. a CycloneDX 1.6 SBOM  - the machine-readable inventory the CRA requires from 11 Dec 2027
-  2. a readiness report    - what you must be able to answer within 24h from 11 Sep 2026
+Reads the obj/project.assets.json graphs `dotnet restore` already produced and emits
+a CycloneDX 1.6 SBOM plus a readiness report.
 
-Usage:  python cra_sbom.py <solution-root> [--out DIR]
+Usage:  python cra_sbom.py <root> [--out DIR] [--check-vulns]
 """
 
 import argparse
@@ -14,203 +12,242 @@ import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-ASSETS = "project.assets.json"
-SKIP_DIRS = {".git", ".claude", ".vs", "node_modules", "TestResults"}
+ASSETS_FILE = "project.assets.json"
+PROPS_FILE = "Directory.Packages.props"
+SKIP_DIRS = frozenset({".git", ".claude", ".vs", "node_modules", "TestResults", "bin"})
 
-TEST_MARKERS = (
-    "xunit", "nunit", "mstest", "moq", "nsubstitute", "fluentassertions",
-    "bogus", "coverlet", "microsoft.net.test.sdk", "testcontainers",
-    "verify", "shouldly", "autofixture", "respawn",
-)
+TEST_SDK = "microsoft.net.test.sdk"
+TEST_RUNNERS = frozenset({"xunit", "xunit.v3", "nunit", "mstest.testframework"})
+TEST_NAME_SUFFIXES = ("tests", ".test", ".unittests", ".integrationtests")
+
+OSV_ENDPOINT = "https://api.osv.dev/v1/querybatch"
+OSV_BATCH_SIZE = 500
+OSV_TIMEOUT_SECONDS = 60
+
+MAX_LISTED_CONFLICTS = 25
+MAX_LISTED_UNPINNED = 12
+MAX_LISTED_PRERELEASE = 15
+MAX_LISTED_PROJECTS = 6
+MAX_LISTED_ADVISORY_IDS = 5
+
+
+@dataclass
+class Component:
+    name: str
+    version: str
+    sha512: str | None = None
+    shipped: bool = False
+    declared_in: set[str] = field(default_factory=set)
+    parents: set[str] = field(default_factory=set)
+    projects: set[str] = field(default_factory=set)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return (self.name, self.version)
+
+    @property
+    def purl(self) -> str:
+        return f"pkg:nuget/{self.name}@{self.version}"
+
+    @property
+    def is_direct(self) -> bool:
+        return bool(self.declared_in)
+
+
+@dataclass
+class Inventory:
+    components: dict[tuple[str, str], Component] = field(default_factory=dict)
+    test_projects: set[str] = field(default_factory=set)
+    all_projects: set[str] = field(default_factory=set)
+    graph_count: int = 0
+
+    def shipped(self) -> list[Component]:
+        return [c for c in self.components.values() if c.shipped]
+
+    def conflicts(self) -> dict[str, list[str]]:
+        versions = defaultdict(set)
+        for component in self.shipped():
+            versions[component.name].add(component.version)
+        return {n: sorted(v) for n, v in versions.items() if len(v) > 1}
+
+
+@dataclass
+class CentralPackages:
+    path: str
+    enabled: bool
+    transitive_pinning: bool
+    pinned: set[str]
 
 
 def find_assets(root):
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        if ASSETS in filenames and os.path.basename(dirpath) == "obj":
-            yield os.path.join(dirpath, ASSETS)
+        if ASSETS_FILE in filenames and os.path.basename(dirpath) == "obj":
+            yield os.path.join(dirpath, ASSETS_FILE)
 
 
-def load(path):
-    with open(path, encoding="utf-8-sig") as fh:
-        return json.load(fh)
+def read_json(path):
+    with open(path, encoding="utf-8-sig") as handle:
+        return json.load(handle)
 
 
 def project_name(doc, path):
-    restore = doc.get("project", {}).get("restore", {})
-    name = restore.get("projectName")
-    if name:
-        return name
-    return os.path.basename(os.path.dirname(os.path.dirname(path)))
+    declared = doc.get("project", {}).get("restore", {}).get("projectName")
+    return declared or os.path.basename(os.path.dirname(os.path.dirname(path)))
 
 
-def direct_names(doc):
-    """Names declared in the csproj itself, versions stripped.
+def declared_names(doc):
+    """Package ids written in the csproj, lowercased.
 
-    centralTransitiveDependencyGroups is deliberately excluded: under central
-    package management those are transitive packages that happen to be pinned,
-    which is the opposite of a direct declaration.
+    centralTransitiveDependencyGroups is excluded on purpose: under central package
+    management those are transitive packages that happen to be pinned, which is the
+    opposite of a direct declaration.
     """
-    out = set()
-    for deps in doc.get("projectFileDependencyGroups", {}).values():
-        for entry in deps:
-            out.add(re.split(r"[\s><=]", entry.strip(), maxsplit=1)[0].lower())
-    return out
+    names = set()
+    for group in doc.get("projectFileDependencyGroups", {}).values():
+        for entry in group:
+            names.add(re.split(r"[\s><=]", entry.strip(), maxsplit=1)[0].lower())
+    return names
 
 
-def central_management(root):
-    """Locate Directory.Packages.props and report what it already pins."""
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        if "Directory.Packages.props" in filenames:
-            path = os.path.join(dirpath, "Directory.Packages.props")
-            try:
-                text = open(path, encoding="utf-8-sig").read()
-            except OSError:
-                continue
-            return {
-                "path": path,
-                "enabled": "true" in re.search(
-                    r"<ManagePackageVersionsCentrally>(.*?)<", text, re.I | re.S
-                ).group(1).lower() if re.search(
-                    r"<ManagePackageVersionsCentrally>(.*?)<", text, re.I | re.S
-                ) else False,
-                "transitive_pinning": bool(
-                    re.search(r"<CentralPackageTransitivePinningEnabled>\s*true", text, re.I)
-                ),
-                "pinned": set(re.findall(r'PackageVersion\s+Include="([^"]+)"', text)),
-            }
-    return None
-
-
-def is_test_project(name, directs):
-    low = name.lower()
-    if low.endswith(("tests", "test", ".unittests", ".integrationtests")):
+def is_test_project(name, declared):
+    if TEST_SDK in declared or declared & TEST_RUNNERS:
         return True
-    return any(any(m in d for m in TEST_MARKERS) for d in directs)
+    return name.lower().endswith(TEST_NAME_SUFFIXES)
 
 
-def collect(root):
-    packages = {}            # (name, version) -> record
-    per_project = {}
-    files = list(find_assets(root))
+def _package_entries(doc):
+    for key, meta in doc.get("libraries", {}).items():
+        if meta.get("type") == "package":
+            name, _, version = key.partition("/")
+            yield name, version, meta
 
-    for path in files:
+
+def _record_parents(doc, inventory):
+    """Attribute each dependency edge to the resolved version inside its own target."""
+    for target in doc.get("targets", {}).values():
+        resolved = {}
+        for key in target:
+            name, _, version = key.partition("/")
+            resolved[name] = version
+        for key, meta in target.items():
+            if meta.get("type") != "package":
+                continue
+            parent = key.partition("/")[0]
+            for dependency in meta.get("dependencies") or {}:
+                version = resolved.get(dependency)
+                component = inventory.components.get((dependency, version))
+                if component is not None and parent != dependency:
+                    component.parents.add(parent)
+
+
+def _absorb(doc, path, inventory):
+    name = project_name(doc, path)
+    declared = declared_names(doc)
+    test = is_test_project(name, declared)
+
+    inventory.all_projects.add(name)
+    if test:
+        inventory.test_projects.add(name)
+
+    for package, version, meta in _package_entries(doc):
+        component = inventory.components.setdefault(
+            (package, version), Component(package, version, meta.get("sha512"))
+        )
+        component.projects.add(name)
+        if package.lower() in declared:
+            component.declared_in.add(name)
+        if not test:
+            component.shipped = True
+
+    _record_parents(doc, inventory)
+
+
+def scan(root):
+    inventory = Inventory()
+    for path in find_assets(root):
         try:
-            doc = load(path)
+            doc = read_json(path)
         except (ValueError, OSError) as exc:
             print(f"  ! skipped {path}: {exc}", file=sys.stderr)
             continue
-
-        name = project_name(doc, path)
-        directs = direct_names(doc)
-        test = is_test_project(name, directs)
-        libs = doc.get("libraries", {})
-
-        resolved = 0
-        for key, meta in libs.items():
-            if meta.get("type") != "package":
-                continue
-            pkg, _, version = key.partition("/")
-            resolved += 1
-            rec = packages.setdefault(
-                (pkg, version),
-                {
-                    "name": pkg,
-                    "version": version,
-                    "sha512": meta.get("sha512"),
-                    "direct": False,
-                    "shipped": False,
-                    "projects": set(),
-                    "parents": set(),
-                    "declared_in": set(),
-                },
-            )
-            rec["projects"].add(name)
-            if pkg.lower() in directs:
-                rec["direct"] = True
-                rec["declared_in"].add(name)
-            if not test:
-                rec["shipped"] = True
-
-        for target in doc.get("targets", {}).values():
-            for key, meta in target.items():
-                parent = key.partition("/")[0]
-                for dep in (meta.get("dependencies") or {}):
-                    for (pkg, version) in packages:
-                        if pkg == dep:
-                            packages[(pkg, version)]["parents"].add(parent)
-
-        per_project[name] = {
-            "direct": len(directs),
-            "resolved": resolved,
-            "test": test,
-            "path": path,
-        }
-
-    return packages, per_project, files
+        inventory.graph_count += 1
+        _absorb(doc, path, inventory)
+    return inventory
 
 
-def purl(name, version):
-    return f"pkg:nuget/{name}@{version}"
-
-
-def query_osv(packages, batch=500):
-    """Match shipped components against OSV.dev.
-
-    Off by default: this sends package names and versions to a third party.
-    They are all public NuGet identifiers, but the combination describes your stack.
-    """
-    import urllib.request
-
-    shipped = sorted(k for k, v in packages.items() if v["shipped"])
-    findings = {}
-    for start in range(0, len(shipped), batch):
-        chunk = shipped[start:start + batch]
-        payload = {
-            "queries": [
-                {"package": {"name": n, "ecosystem": "NuGet"}, "version": v}
-                for n, v in chunk
-            ]
-        }
-        req = urllib.request.Request(
-            "https://api.osv.dev/v1/querybatch",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
+def read_central_packages(root):
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        if PROPS_FILE not in filenames:
+            continue
+        path = os.path.join(dirpath, PROPS_FILE)
+        try:
+            with open(path, encoding="utf-8-sig") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        return CentralPackages(
+            path=path,
+            enabled=bool(re.search(r"<ManagePackageVersionsCentrally>\s*true", text, re.I)),
+            transitive_pinning=bool(
+                re.search(r"<CentralPackageTransitivePinningEnabled>\s*true", text, re.I)
+            ),
+            pinned=set(re.findall(r'PackageVersion\s+Include="([^"]+)"', text)),
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            results = json.load(resp).get("results", [])
-        for key, result in zip(chunk, results):
-            vulns = result.get("vulns") or []
-            if vulns:
-                findings[key] = [v["id"] for v in vulns]
-        print(f"  checked {min(start + batch, len(shipped))}/{len(shipped)}")
+    return None
+
+
+def query_osv(components, batch_size=OSV_BATCH_SIZE):
+    """Match components against OSV.dev. Sends package ids to a third party."""
+    keys = sorted(c.key for c in components)
+    findings = {}
+    for start in range(0, len(keys), batch_size):
+        chunk = keys[start:start + batch_size]
+        findings.update(_query_osv_batch(chunk))
+        print(f"  checked {min(start + batch_size, len(keys))}/{len(keys)}")
     return findings
 
 
-def build_cyclonedx(packages, root):
-    serial = hashlib.sha256(os.path.abspath(root).encode()).hexdigest()[:32]
-    components = []
-    for (name, version), rec in sorted(packages.items()):
-        comp = {
-            "type": "library",
-            "bom-ref": purl(name, version),
-            "name": name,
-            "version": version,
-            "purl": purl(name, version),
-            "scope": "required" if rec["shipped"] else "optional",
-        }
-        if rec["sha512"]:
-            comp["hashes"] = [{"alg": "SHA-512", "content": rec["sha512"]}]
-        components.append(comp)
+def _query_osv_batch(chunk):
+    payload = {
+        "queries": [
+            {"package": {"name": name, "ecosystem": "NuGet"}, "version": version}
+            for name, version in chunk
+        ]
+    }
+    request = urllib.request.Request(
+        OSV_ENDPOINT,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=OSV_TIMEOUT_SECONDS) as response:
+            results = json.load(response).get("results", [])
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        raise RuntimeError(f"OSV query failed: {exc}") from exc
 
+    found = {}
+    for key, result in zip(chunk, results):
+        ids = [v["id"] for v in result.get("vulns") or []]
+        if ids:
+            found[key] = ids
+    return found
+
+
+def to_cyclonedx(inventory, root):
+    digest = hashlib.sha256(os.path.abspath(root).encode()).hexdigest()[:32]
+    serial = "-".join([digest[:8], digest[8:12], digest[12:16], digest[16:20], digest[20:32]])
     return {
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
-        "serialNumber": f"urn:uuid:{serial[:8]}-{serial[8:12]}-{serial[12:16]}-{serial[16:20]}-{serial[20:32]}",
+        "serialNumber": f"urn:uuid:{serial}",
         "version": 1,
         "metadata": {
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -219,194 +256,230 @@ def build_cyclonedx(packages, root):
                 "bom-ref": "root-application",
                 "name": os.path.basename(os.path.abspath(root)) or "application",
             },
-            "tools": {"components": [{"type": "application", "name": "cra_sbom.py"}]},
+            "tools": {"components": [{"type": "application", "name": "cra-sbom"}]},
         },
-        "components": components,
+        "components": [_component_json(c) for _, c in sorted(inventory.components.items())],
     }
 
 
-def report(packages, per_project, files, root, vulns=None, cpm=None):
-    shipped = {k: v for k, v in packages.items() if v["shipped"]}
-    direct_shipped = {k: v for k, v in shipped.items() if v["direct"]}
+def _component_json(component):
+    entry = {
+        "type": "library",
+        "bom-ref": component.purl,
+        "name": component.name,
+        "version": component.version,
+        "purl": component.purl,
+        "scope": "required" if component.shipped else "optional",
+    }
+    if component.sha512:
+        entry["hashes"] = [{"alg": "SHA-512", "content": component.sha512}]
+    return entry
 
-    by_name = defaultdict(set)
-    for (name, version), rec in shipped.items():
-        by_name[name].add(version)
-    conflicts = {n: sorted(v) for n, v in by_name.items() if len(v) > 1}
 
-    unpinned = [k for k, v in shipped.items() if not v["sha512"]]
-    prerelease = sorted({k[0] + " " + k[1] for k in shipped if "-" in k[1]})
+def _truncated(items, limit, render):
+    lines = [render(item) for item in items[:limit]]
+    if len(items) > limit:
+        lines.append(f"- ... and {len(items) - limit} more")
+    return lines
 
-    projects_shipped = [n for n, m in per_project.items() if not m["test"]]
 
+def _numbers_section(inventory, root):
+    shipped = inventory.shipped()
+    direct = [c for c in shipped if c.is_direct]
+    shipping_projects = inventory.all_projects - inventory.test_projects
+    lines = [
+        f"# CRA readiness - {os.path.basename(os.path.abspath(root))}",
+        "",
+        f"Generated {datetime.now(timezone.utc):%Y-%m-%d %H:%M UTC} from "
+        f"{inventory.graph_count} restore graphs. No external tooling.",
+        "",
+        "## The numbers",
+        "",
+        "| | Count |",
+        "|---|---|",
+        f"| Projects analysed | {len(inventory.all_projects)} |",
+        f"| Shipping projects (non-test) | {len(shipping_projects)} |",
+        f"| **Components in shipped product** | **{len(shipped)}** |",
+        f"| Declared directly in a csproj | {len(direct)} |",
+        f"| Pulled in transitively | {len(shipped) - len(direct)} |",
+        f"| Test-only components (out of CRA scope) | {len(inventory.components) - len(shipped)} |",
+    ]
+    if direct:
+        lines.append(f"| Amplification factor | {len(shipped) / len(direct):.1f}x |")
+    lines += ["", "The CRA asks what is *in* the product, not what you chose to reference.", ""]
+    return lines
+
+
+def _conflicts_section(conflicts):
+    if not conflicts:
+        return ["## Findings", "", "### No version conflicts", "",
+                "Every shipped package resolves to a single version.", ""]
+    lines = [
+        "## Findings", "",
+        f"### {len(conflicts)} packages resolve to more than one version", "",
+        "An advisory names one version. If your solution ships several, a 24-hour",
+        "report means checking each.", "",
+    ]
+    lines += _truncated(
+        sorted(conflicts), MAX_LISTED_CONFLICTS,
+        lambda n: f"- `{n}` - {', '.join(conflicts[n])}",
+    )
+    return lines + [""]
+
+
+def _prerelease_section(shipped):
+    items = sorted(f"{c.name} {c.version}" for c in shipped if "-" in c.version)
+    if not items:
+        return []
+    lines = [f"### {len(items)} pre-release versions in shipped code", ""]
+    lines += _truncated(items, MAX_LISTED_PRERELEASE, lambda i: f"- `{i}`")
+    return lines + [""]
+
+
+def _provenance_lines(component):
     lines = []
-    add = lines.append
-    add(f"# CRA readiness - {os.path.basename(os.path.abspath(root))}")
-    add("")
-    add(f"Generated {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} "
-        f"from {len(files)} restore graphs. No external tooling.")
-    add("")
-    add("## The numbers")
-    add("")
-    add("| | Count |")
-    add("|---|---|")
-    add(f"| Projects analysed | {len(per_project)} |")
-    add(f"| Shipping projects (non-test) | {len(projects_shipped)} |")
-    add(f"| **Components in shipped product** | **{len(shipped)}** |")
-    add(f"| Declared directly in a csproj | {len(direct_shipped)} |")
-    add(f"| Pulled in transitively | {len(shipped) - len(direct_shipped)} |")
-    add(f"| Test-only components (out of CRA scope) | {len(packages) - len(shipped)} |")
-    if direct_shipped:
-        add(f"| Amplification factor | {len(shipped) / len(direct_shipped):.1f}x |")
-    add("")
-    add("The gap between rows 4 and 5 is the whole point. The CRA asks what is *in* the")
-    add("product, not what you chose to reference.")
-    add("")
-    add("## Findings")
-    add("")
+    declared = sorted(component.declared_in)
+    if declared:
+        lines.append(
+            f"  - Declared directly in {len(declared)} project(s): "
+            f"{_names(declared)} - **you control this version, bump it**"
+        )
+    parents = sorted(component.parents)
+    if parents:
+        hint = "" if declared else " - bump the parent, or pin deliberately"
+        lines.append(f"  - Pulled in by {_names(parents)}{hint}")
+    lines.append(f"  - Reaches {len(component.projects)} project(s)")
+    return lines
 
-    if conflicts:
-        add(f"### {len(conflicts)} packages resolve to more than one version")
-        add("")
-        add("A vulnerability advisory names one version. If your solution ships several,")
-        add("a 24-hour report means checking each. These are the ones to unify first -")
-        add("central package management (`Directory.Packages.props`) removes the class of problem.")
-        add("")
-        for name in sorted(conflicts)[:25]:
-            add(f"- `{name}` - {', '.join(conflicts[name])}")
-        if len(conflicts) > 25:
-            add(f"- ... and {len(conflicts) - 25} more")
-        add("")
-    else:
-        add("### No version conflicts")
-        add("")
-        add("Every shipped package resolves to a single version. Good starting position.")
-        add("")
 
-    if prerelease:
-        add(f"### {len(prerelease)} pre-release versions in shipped code")
-        add("")
-        for item in prerelease[:15]:
-            add(f"- `{item}`")
-        if len(prerelease) > 15:
-            add(f"- ... and {len(prerelease) - 15} more")
-        add("")
+def _names(values):
+    shown = ", ".join(f"`{v}`" for v in values[:MAX_LISTED_PROJECTS])
+    extra = len(values) - MAX_LISTED_PROJECTS
+    return shown + (f" (+{extra})" if extra > 0 else "")
 
-    if unpinned:
-        add(f"### {len(unpinned)} components without an integrity hash")
-        add("")
-        for name, version in sorted(unpinned)[:10]:
-            add(f"- `{name}` {version}")
-        add("")
 
-    if vulns is not None:
-        if vulns:
-            add(f"### {len(vulns)} shipped components have known advisories")
-            add("")
-            add("Matched against OSV.dev. An advisory is not automatically a CRA report -")
-            add("the 11 September obligation triggers on *actively exploited* vulnerabilities.")
-            add("Treat this as the triage queue, not the incident list.")
-            add("")
-            for (name, version), ids in sorted(vulns.items()):
-                rec = packages[(name, version)]
-                add(f"**`{name}` {version}** - {len(ids)} advisor"
-                    + ("y" if len(ids) == 1 else "ies")
-                    + f": {', '.join(ids[:5])}"
-                    + (f" (+{len(ids) - 5} more)" if len(ids) > 5 else ""))
-                declared = sorted(rec["declared_in"])
-                if declared:
-                    shown = ", ".join(f"`{d}`" for d in declared[:6])
-                    more = f" (+{len(declared) - 6})" if len(declared) > 6 else ""
-                    add(f"  - Declared directly in {len(declared)} project(s): {shown}{more}"
-                        " - **you control this version, bump it**")
-                parents = sorted(rec["parents"] - {name})
-                if parents:
-                    shown = ", ".join(f"`{x}`" for x in parents[:6])
-                    more = f" (+{len(parents) - 6})" if len(parents) > 6 else ""
-                    add(f"  - Pulled in by {shown}{more}"
-                        + ("" if declared else " - bump the parent, or pin deliberately"))
-                add(f"  - Reaches {len(rec['projects'])} project(s)")
-                add("")
-            add("")
-        else:
-            add("### No known advisories")
-            add("")
-            add("All shipped components came back clean from OSV.dev at generation time.")
-            add("That is a snapshot, not a state - it is why this has to run on a schedule.")
-            add("")
+def _advisories_section(inventory, vulns):
+    if vulns is None:
+        return []
+    if not vulns:
+        return ["### No known advisories", "",
+                "All shipped components were clean at generation time. That is a",
+                "snapshot, not a state - which is why this runs on a schedule.", ""]
+    lines = [
+        f"### {len(vulns)} shipped components have known advisories", "",
+        "Matched against OSV.dev. An advisory is not automatically a CRA report - the",
+        "11 September obligation triggers on *actively exploited* vulnerabilities.", "",
+    ]
+    for key, ids in sorted(vulns.items()):
+        shown = ", ".join(ids[:MAX_LISTED_ADVISORY_IDS])
+        extra = len(ids) - MAX_LISTED_ADVISORY_IDS
+        suffix = f" (+{extra} more)" if extra > 0 else ""
+        plural = "y" if len(ids) == 1 else "ies"
+        lines.append(f"**`{key[0]}` {key[1]}** - {len(ids)} advisor{plural}: {shown}{suffix}")
+        lines += _provenance_lines(inventory.components[key])
+        lines.append("")
+    return lines
 
-    add("## What each date actually asks of you")
-    add("")
-    add("**11 September 2026** - report actively exploited vulnerabilities within 24 hours,")
-    add("including in products already shipped. You cannot do that without this inventory,")
-    add(f"and yours has {len(shipped)} entries to watch.")
-    add("")
-    add("**11 December 2027** - CE marking plus a machine-readable SBOM covering at least")
-    add("top-level dependencies. `sbom.cdx.json` beside this file is that artefact, in")
-    add("CycloneDX 1.6, ready to attach to a release.")
-    add("")
-    add("## Next steps")
-    add("")
-    add("1. Attach `sbom.cdx.json` to every release build so the inventory matches the artefact.")
+
+def _dates_section(shipped_count):
+    return [
+        "## What each date asks of you", "",
+        "**11 September 2026** - report actively exploited vulnerabilities within 24",
+        "hours, including in products already shipped. You cannot do that without this",
+        f"inventory, and yours has {shipped_count} entries to watch.", "",
+        "**11 December 2027** - CE marking plus a machine-readable SBOM covering at",
+        "least top-level dependencies. `sbom.cdx.json` is that artefact.", "",
+    ]
+
+
+def _next_steps_section(conflicts, central):
+    lines = ["## Next steps", "",
+             "1. Attach `sbom.cdx.json` to every release so the inventory matches the binary."]
     step = 2
     if conflicts:
-        if cpm and cpm["enabled"]:
-            unpinned_conflicts = sorted(set(conflicts) - cpm["pinned"])
-            add(f"{step}. Central package management is already on"
-                + (" with transitive pinning" if cpm["transitive_pinning"] else "")
-                + f" ({len(cpm['pinned'])} versions pinned), so the fix is narrow: "
-                + f"**{len(unpinned_conflicts)} of the {len(conflicts)} conflicting packages "
-                "are missing from `Directory.Packages.props`.** Add them and the conflict "
-                "resolves at the next restore.")
-            if unpinned_conflicts:
-                add("")
-                for name in unpinned_conflicts[:12]:
-                    add(f"   - `{name}` - {', '.join(conflicts[name])}")
-                if len(unpinned_conflicts) > 12:
-                    add(f"   - ... and {len(unpinned_conflicts) - 12} more")
-                add("")
-        else:
-            add(f"{step}. Adopt central package management to collapse the version conflicts above.")
+        lines += _conflict_remedy(conflicts, central, step)
         step += 1
-    add(f"{step}. Feed the purls to an advisory source (OSV, GitHub Advisory) on a schedule.")
-    add(f"{step + 1}. Write the 24-hour disclosure runbook - who decides, who files, to which CSIRT.")
-    add("")
-    add("Verify scope against the CRA text before relying on this. A SaaS backend may sit")
-    add("outside 'products with digital elements' depending on how it is delivered - that is")
-    add("a legal question, not a tooling one.")
+    lines += [
+        f"{step}. Feed the purls to an advisory source on a schedule.",
+        f"{step + 1}. Write the 24-hour disclosure runbook - who decides, who files, to which CSIRT.",
+        "",
+        "Whether your product is in CRA scope is a legal question, not a tooling one.",
+    ]
+    return lines
+
+
+def _conflict_remedy(conflicts, central, step):
+    if not (central and central.enabled):
+        return [f"{step}. Adopt central package management to collapse the conflicts above."]
+    missing = sorted(set(conflicts) - central.pinned)
+    pinning = " with transitive pinning" if central.transitive_pinning else ""
+    lines = [
+        f"{step}. Central package management is already on{pinning} "
+        f"({len(central.pinned)} versions pinned), so the fix is narrow: "
+        f"**{len(missing)} of the {len(conflicts)} conflicting packages are missing "
+        f"from `{PROPS_FILE}`.** Add them and the conflict resolves at the next restore.",
+        "",
+    ]
+    lines += _truncated(missing, MAX_LISTED_UNPINNED,
+                        lambda n: f"   - `{n}` - {', '.join(conflicts[n])}")
+    return lines + [""]
+
+
+def build_report(inventory, root, vulns=None, central=None):
+    shipped = inventory.shipped()
+    conflicts = inventory.conflicts()
+    lines = _numbers_section(inventory, root)
+    lines += _conflicts_section(conflicts)
+    lines += _prerelease_section(shipped)
+    lines += _advisories_section(inventory, vulns)
+    lines += _dates_section(len(shipped))
+    lines += _next_steps_section(conflicts, central)
     return "\n".join(lines) + "\n"
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("root")
-    ap.add_argument("--out", default=".")
-    ap.add_argument("--check-vulns", action="store_true",
-                    help="query OSV.dev; sends package names and versions to a third party")
-    args = ap.parse_args()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="CRA readiness for a .NET solution.")
+    parser.add_argument("root", help="solution root to scan")
+    parser.add_argument("--out", default=".", help="output directory")
+    parser.add_argument(
+        "--check-vulns",
+        action="store_true",
+        help="query OSV.dev; sends package names and versions to a third party",
+    )
+    return parser.parse_args(argv)
 
+
+def main(argv=None):
+    args = parse_args(argv)
     print(f"Scanning {args.root} ...")
-    packages, per_project, files = collect(args.root)
-    if not files:
-        print("No project.assets.json found. Run 'dotnet restore' first.", file=sys.stderr)
+    inventory = scan(args.root)
+    if not inventory.graph_count:
+        print(f"No {ASSETS_FILE} found. Run 'dotnet restore' first.", file=sys.stderr)
         return 1
+
+    vulns = None
+    if args.check_vulns:
+        print("Querying OSV.dev ...")
+        try:
+            vulns = query_osv(inventory.shipped())
+        except RuntimeError as exc:
+            print(f"{exc}", file=sys.stderr)
+            return 2
+
+    sbom = to_cyclonedx(inventory, args.root)
+    report = build_report(inventory, args.root, vulns, read_central_packages(args.root))
 
     os.makedirs(args.out, exist_ok=True)
     sbom_path = os.path.join(args.out, "sbom.cdx.json")
     report_path = os.path.join(args.out, "cra-readiness.md")
+    with open(sbom_path, "w", encoding="utf-8") as handle:
+        json.dump(sbom, handle, indent=2)
+    with open(report_path, "w", encoding="utf-8") as handle:
+        handle.write(report)
 
-    with open(sbom_path, "w", encoding="utf-8") as fh:
-        json.dump(build_cyclonedx(packages, args.root), fh, indent=2)
-    vulns = None
-    if args.check_vulns:
-        print("Querying OSV.dev ...")
-        vulns = query_osv(packages)
-
-    with open(report_path, "w", encoding="utf-8") as fh:
-        fh.write(report(packages, per_project, files, args.root, vulns, central_management(args.root)))
-
-    shipped = sum(1 for v in packages.values() if v["shipped"])
-    print(f"  {len(files)} restore graphs, {len(packages)} components ({shipped} shipped)")
+    shipped = len(inventory.shipped())
+    print(f"  {inventory.graph_count} restore graphs, "
+          f"{len(inventory.components)} components ({shipped} shipped)")
     print(f"  -> {sbom_path}")
     print(f"  -> {report_path}")
     return 0
